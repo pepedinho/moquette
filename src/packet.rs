@@ -46,9 +46,9 @@ pub struct PublishFlag {
 }
 
 pub struct ControlPacket {
-    header: FixedHeader,
-    vheader: VariableHeader,
-    payload: Option<Vec<u8>>,
+    pub header: FixedHeader,
+    pub vheader: VariableHeader,
+    pub payload: Option<Vec<u8>>,
 }
 
 pub struct FixedHeader {
