@@ -1,8 +1,9 @@
-use std::mem::transmute;
-
-use crate::packet::types::{
-    ConnectFlag, ConnectPayload, ControlPacketType, FixedHeader, Payload, PublishFlag,
-    RemainingLength, VariableHeader,
+use crate::packet::{
+    reader::BufferReader,
+    types::{
+        ConnectFlag, ConnectPayload, ControlPacketType, FixedHeader, Payload, RemainingLength,
+        TopicFilter, VariableHeader,
+    },
 };
 
 #[derive(Debug)]
@@ -12,282 +13,246 @@ pub struct ControlPacket {
     pub payload: Payload,
 }
 
-impl TryFrom<u8> for ControlPacketType {
-    type Error = &'static str;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        if value > 0 && value <= 14 {
-            //BUG: can maybe cause arbitrary segfault so
-            //rewrite it in safe way.
-            let o: ControlPacketType = unsafe { transmute(value as i32) };
-            Ok(o)
-        } else {
-            Err("Control packet type representation musty be between 1 and 14")
-        }
-    }
-}
-
-impl TryFrom<u8> for ConnectFlag {
-    type Error = &'static str;
-
-    fn try_from(byte: u8) -> Result<Self, Self::Error> {
-        if (byte & 0x01) != 0 {
-            return Err("Bit of 0 of Connext flag must be 0");
-        }
-
-        let will_qos = (byte & 0x18) >> 3;
-        if will_qos > 2 {
-            return Err("Invalid Will QoS level (must be 0, 1 or 2)");
-        }
-
-        let will_flag = (byte & 0x04) != 0;
-
-        if !will_flag && (will_qos != 0) || (byte & 0x20) != 0 {
-            return Err("Will QoS and Will Retain must be 0 if Will Flag is 0");
-        }
-
-        Ok(ConnectFlag {
-            username_flag: (byte & 0x80) != 0,
-            password_flag: (byte & 0x40) != 0,
-            will_retain: (byte & 0x20) != 0,
-            will_qos,
-            will_flag,
-            clean_session: (byte & 0x02) != 0,
-        })
-    }
-}
-
 impl ControlPacket {
     pub fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
-        let header = FixedHeader::from_raw_bytes(bytes)?;
-        let offset = 1 + header.remaining_length.br;
-        let total_expected_len = offset + header.remaining_length.l;
-
-        if bytes.len() < total_expected_len {
-            return Err("Incomplete packet: byte slice is shorter than remaining length");
-        }
-
-        let body = &bytes[offset..total_expected_len];
-
-        let (vheader, payload) = match header.r#type {
-            ControlPacketType::Connect => Self::parse_connect_body(body)?,
-            ControlPacketType::Publish(ref flags) => Self::parse_publish_body(body, flags)?,
-            ControlPacketType::Subscribe => Self::parse_subscribe_body(body)?,
-            ControlPacketType::Unsubscribe => Self::parse_unsubscribe_body(body)?,
-            ControlPacketType::Puback
-            | ControlPacketType::Pubrec
-            | ControlPacketType::Pubrel
-            | ControlPacketType::Pubcomp => Self::parse_id(body)?,
-            ControlPacketType::Pingreq | ControlPacketType::Disconnect => {
-                if !body.is_empty() {
-                    return Err("Packet must have remaining length of 0");
-                }
-                (VariableHeader::None, Payload::None)
-            }
-            ControlPacketType::Connack
-            | ControlPacketType::Suback
-            | ControlPacketType::Unsuback
-            | ControlPacketType::Pingresp => {
-                return Err("Received server-only packet from client");
-            }
-        };
-
+        let (header, vheader, payload) = decode_client_packet(bytes)?;
         Ok(Self {
             header,
             vheader,
             payload,
         })
     }
+}
 
-    fn parse_id(body: &[u8]) -> Result<(VariableHeader, Payload), &'static str> {
-        if body.len() < 2 {
-            return Err("Publish body too short for topic length");
-        }
-
-        let packet_id = u16::from_be_bytes([body[0], body[1]]);
-
-        Ok((VariableHeader::PacketId(packet_id), Payload::None))
+pub fn decode_client_packet(
+    bytes: &[u8],
+) -> Result<(FixedHeader, VariableHeader, Payload), &'static str> {
+    if bytes.is_empty() {
+        return Err("Empty buffer");
     }
 
-    fn parse_subscribe_body(body: &[u8]) -> Result<(VariableHeader, Payload), &'static str> {
-        if body.len() < 2 {
-            return Err("SUBSCRIBE body too short for packet ID");
-        }
-        let packet_id = u16::from_be_bytes([body[0], body[1]]);
-        let payload = Payload::parse_subscribe(&body[2..])?;
-        Ok((VariableHeader::PacketId(packet_id), payload))
+    let fixed_header = FixedHeader::from_bytes(bytes)?;
+
+    let header_len = 1 + fixed_header.remaining_length.br;
+    let total_len = header_len + fixed_header.remaining_length.l;
+
+    if bytes.len() < total_len {
+        return Err("Incomplete packet");
     }
 
-    fn parse_unsubscribe_body(body: &[u8]) -> Result<(VariableHeader, Payload), &'static str> {
-        if body.len() < 2 {
-            return Err("UNSUBSCRIBE body too short for packet ID");
+    let body_bytes = &bytes[header_len..total_len];
+    let mut reader = BufferReader::new(body_bytes);
+
+    let (variable_header, payload) = match fixed_header.r#type {
+        ControlPacketType::Connect => {
+            let vheader = VariableHeader::parse_connect(&mut reader)?;
+            let payload = Payload::parse_connect(&mut reader, &vheader)?;
+            (vheader, payload)
         }
-        let packet_id = u16::from_be_bytes([body[0], body[1]]);
-        let payload = Payload::parse_unsubscribe(&body[2..])?;
-        Ok((VariableHeader::PacketId(packet_id), payload))
-    }
-
-    fn parse_publish_body(
-        body: &[u8],
-        flags: &PublishFlag,
-    ) -> Result<(VariableHeader, Payload), &'static str> {
-        if body.len() < 2 {
-            return Err("Publish body too short for topic length");
+        ControlPacketType::Publish => {
+            let vheader = VariableHeader::parse_publish(&mut reader, fixed_header.flags)?;
+            let payload = Payload::parse_publish(&mut reader)?;
+            (vheader, payload)
         }
-
-        let str_len = u16::from_be_bytes([body[0], body[1]]) as usize;
-        let mut offset = 2 + str_len;
-
-        if body.len() < offset {
-            return Err("Publish body too short for topic name");
+        ControlPacketType::Subscribe => {
+            let vheader = VariableHeader::parse_packet_id(&mut reader)?;
+            let payload = Payload::parse_subscribe(&mut reader)?;
+            (vheader, payload)
         }
-
-        let topic_name = std::str::from_utf8(&body[2..offset])
-            .map_err(|_| "Non utf8 string detected in publish Variable Header")?;
-
-        let packet_id = if flags.qos > 0 {
-            if body.len() < offset + 2 {
-                return Err("Publish body too short for packet id");
-            }
-            let id = &body[offset..offset + 2];
-            let id = u16::from_be_bytes([id[0], id[1]]);
-            offset += 2;
-            Some(id)
-        } else {
-            None
-        };
-
-        let vheader = VariableHeader::Publish {
-            topic_name: topic_name.to_string(),
-            packet_id,
-        };
-
-        let payload = Payload::Publish(body[offset..].to_vec());
-
-        Ok((vheader, payload))
-    }
-
-    fn parse_connect_body(body: &[u8]) -> Result<(VariableHeader, Payload), &'static str> {
-        if body.len() < 2 {
-            return Err("CONNECT body too short");
+        ControlPacketType::Unsubscribe => {
+            let vheader = VariableHeader::parse_packet_id(&mut reader)?;
+            let payload = Payload::parse_unsubscribe(&mut reader)?;
+            (vheader, payload)
         }
-
-        let str_len = u16::from_be_bytes([body[0], body[1]]) as usize;
-        let mut offset = 2 + str_len;
-
-        if body.len() < offset {
-            return Err("CONNECT body to short for protocol name");
+        ControlPacketType::Puback
+        | ControlPacketType::Pubrec
+        | ControlPacketType::Pubrel
+        | ControlPacketType::Pubcomp => {
+            let vheader = VariableHeader::parse_packet_id(&mut reader)?;
+            (vheader, Payload::None)
         }
-
-        let protocol_name = std::str::from_utf8(&body[2..offset])
-            .map_err(|_| "Non utf-8 struct detected in Connect protocol name")?;
-
-        if body.len() < offset + 4 {
-            return Err("CONNECT body too short for variable header fields");
+        ControlPacketType::Pingreq | ControlPacketType::Disconnect => {
+            (VariableHeader::None, Payload::None)
         }
+        _ => return Err("Unexpected or unsupported control packet type"),
+    };
 
-        let protocol_level = body[offset];
-        offset += 1;
-
-        let connect_flag = ConnectFlag::try_from(body[offset])?;
-        offset += 1;
-
-        let keep_alive = u16::from_be_bytes([body[offset], body[offset + 1]]);
-        offset += 2;
-
-        let mut raw_payload = &body[offset..];
-
-        let payload = Payload::Connect(ConnectPayload::from_raw(&mut raw_payload, &connect_flag)?);
-
-        Ok((
-            VariableHeader::Connect {
-                protocol_name: protocol_name.to_string(),
-                protocol_level,
-                connect_flag,
-                keep_alive,
-            },
-            payload,
-        ))
-    }
+    Ok((fixed_header, variable_header, payload))
 }
 
 impl FixedHeader {
-    pub fn from_raw_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
         if bytes.is_empty() {
             return Err("Empty buffer: cannot parse fixed header");
         }
 
-        let r#type = bytes[0] >> 4;
-        let flag = bytes[0] & 0x0F;
+        let byte0 = bytes[0];
+        let type_u8 = byte0 >> 4;
+        let flags = byte0 & 0x0F;
 
-        let mut r#type = ControlPacketType::try_from(r#type)?;
-        if !Self::check_flag(&mut r#type, flag) {
-            //TODO: Close connection here
-            return Err("Invalid flag detected");
-        }
-        let remaining_length = Self::decoding_remainin_length(&bytes[1..])?;
+        let packet_type = ControlPacketType::try_from(type_u8)?;
 
-        Ok(Self {
-            r#type,
-            remaining_length,
-        })
-    }
-
-    fn check_flag(packet_type: &mut ControlPacketType, flag: u8) -> bool {
         match packet_type {
-            ControlPacketType::Publish(f) => {
-                f.dup = (flag & 0x08) != 0;
-                f.qos = (flag & 0x06) >> 1;
-                f.retain = (flag & 0x01) != 0;
-                if f.qos == 3 {
-                    return false;
-                }
-                return true;
-            }
+            ControlPacketType::Publish => {}
             ControlPacketType::Pubrel
             | ControlPacketType::Subscribe
             | ControlPacketType::Unsubscribe => {
-                if flag == 0x2 {
-                    return true;
+                if flags != 2 {
+                    return Err("Invalid flag detected");
                 }
             }
             _ => {
-                if flag == 0x00 {
-                    return true;
+                if flags != 0 {
+                    return Err("Invalid flag detected");
                 }
             }
         }
-        false
+
+        let remaining_length = parse_remaining_length(&bytes[1..])?;
+
+        Ok(FixedHeader {
+            r#type: packet_type,
+            flags,
+            remaining_length,
+        })
     }
+}
 
-    fn decoding_remainin_length(bytes: &[u8]) -> Result<RemainingLength, &'static str> {
-        let mut value: usize = 0;
-        let mut multiplier = 1;
-        let mut bytes_read = 0;
-        loop {
-            if bytes_read >= bytes.len() {
-                return Err("Incomplete remaining length data");
-            }
-
-            if bytes_read >= 4 {
-                return Err("Malformed remaining length: exceeds 4 bytes");
-            }
-
-            let encoded_byte = bytes[bytes_read];
-            bytes_read += 1;
-
-            value += (encoded_byte & 127) as usize * multiplier;
-            if (encoded_byte & 0x80) == 0 {
-                break;
-            }
-
-            multiplier *= 128;
+fn parse_remaining_length(bytes: &[u8]) -> Result<RemainingLength, &'static str> {
+    let mut value: usize = 0;
+    let mut multiplier = 1;
+    let mut bytes_read = 0;
+    loop {
+        if bytes_read >= bytes.len() {
+            return Err("Incomplete remaining length data");
         }
 
-        Ok(RemainingLength {
-            l: value,
-            br: bytes_read,
+        if bytes_read >= 4 {
+            return Err("Malformed remaining length: exceeds 4 bytes");
+        }
+
+        let encoded_byte = bytes[bytes_read];
+        bytes_read += 1;
+
+        value += (encoded_byte & 127) as usize * multiplier;
+        if (encoded_byte & 0x80) == 0 {
+            break;
+        }
+
+        multiplier *= 128;
+    }
+
+    Ok(RemainingLength {
+        l: value,
+        br: bytes_read,
+    })
+}
+
+impl VariableHeader {
+    pub fn parse_connect(reader: &mut BufferReader) -> Result<Self, &'static str> {
+        let protocol_name = reader.read_string()?;
+        let protocol_level = reader.read_u8()?;
+        let connect_flag = ConnectFlag::try_from(reader.read_u8()?)?;
+        let keep_alive = reader.read_u16()?;
+
+        Ok(VariableHeader::Connect {
+            protocol_name,
+            protocol_level,
+            connect_flag,
+            keep_alive,
         })
+    }
+
+    pub fn parse_publish(reader: &mut BufferReader, flags: u8) -> Result<Self, &'static str> {
+        let topic_name = reader.read_string()?;
+        let qos = (flags & 0x06) >> 1;
+
+        let packet_id = if qos > 0 {
+            Some(reader.read_u16()?)
+        } else {
+            None
+        };
+
+        Ok(VariableHeader::Publish {
+            topic_name,
+            packet_id,
+        })
+    }
+
+    pub fn parse_packet_id(reader: &mut BufferReader) -> Result<Self, &'static str> {
+        let packet_id = reader.read_u16()?;
+        Ok(VariableHeader::PacketId(packet_id))
+    }
+}
+
+impl Payload {
+    pub fn parse_connect(
+        reader: &mut BufferReader,
+        vheader: &VariableHeader,
+    ) -> Result<Self, &'static str> {
+        let connect_flag = match vheader {
+            VariableHeader::Connect { connect_flag, .. } => connect_flag,
+            _ => return Err("Invalid variable header for CONNECT payload"),
+        };
+
+        let client_id = reader.read_string()?;
+
+        let (will_topic, will_message) = if connect_flag.will_flag {
+            (Some(reader.read_string()?), Some(reader.read_bytes()?))
+        } else {
+            (None, None)
+        };
+
+        let username = if connect_flag.username_flag {
+            Some(reader.read_string()?)
+        } else {
+            None
+        };
+
+        let password = if connect_flag.password_flag {
+            Some(reader.read_bytes()?)
+        } else {
+            None
+        };
+
+        Ok(Payload::Connect(ConnectPayload {
+            client_id,
+            will_topic,
+            will_message,
+            username,
+            password,
+        }))
+    }
+
+    pub fn parse_publish(reader: &mut BufferReader) -> Result<Self, &'static str> {
+        Ok(Payload::Publish(reader.read_remaining()))
+    }
+
+    pub fn parse_subscribe(reader: &mut BufferReader) -> Result<Self, &'static str> {
+        let mut filters = Vec::new();
+
+        while !reader.is_empty() {
+            let filter = reader.read_string()?;
+            let qos = reader.read_u8()?;
+
+            if qos > 2 {
+                return Err("Invalid QoS in Subscribe payload");
+            }
+
+            filters.push(TopicFilter { filter, qos });
+        }
+
+        Ok(Payload::Subscribe(filters))
+    }
+
+    pub fn parse_unsubscribe(reader: &mut BufferReader) -> Result<Self, &'static str> {
+        let mut topics = Vec::new();
+
+        while !reader.is_empty() {
+            topics.push(reader.read_string()?);
+        }
+
+        Ok(Payload::Unsubscribe(topics))
     }
 }
 
@@ -317,7 +282,7 @@ mod test {
 
         assert!(cp_type.is_ok());
         if let Ok(t) = cp_type {
-            assert_eq!(t, ControlPacketType::Publish(PublishFlag::default()));
+            assert_eq!(t, ControlPacketType::Publish);
         } else {
             panic!("Failed to convert {:?}", cp_type.ok());
         }
@@ -327,31 +292,30 @@ mod test {
     fn decode_header_remaining_length() {
         // Length to 0
         let bytes = &[0x00];
-        let res = FixedHeader::decoding_remainin_length(bytes).unwrap();
+        let res = parse_remaining_length(bytes).unwrap();
         assert_eq!(res.l, 0);
         assert_eq!(res.br, 1);
 
         // Length to 127 (max on 1 byte)
         let bytes = &[0x7F];
-        let res = FixedHeader::decoding_remainin_length(bytes).unwrap();
+        let res = parse_remaining_length(bytes).unwrap();
         assert_eq!(res.l, 127);
         assert_eq!(res.br, 1);
 
         // Length to 128 (overlap on 2 byte)
         let bytes = &[0x80, 0x01];
-        let res = FixedHeader::decoding_remainin_length(bytes).unwrap();
+        let res = parse_remaining_length(bytes).unwrap();
         assert_eq!(res.l, 128);
         assert_eq!(res.br, 2);
 
         // Incomptete byte (continue bit is on but no other bytes was provided)
         let bytes = &[0x80];
-        let res = FixedHeader::decoding_remainin_length(bytes);
+        let res = parse_remaining_length(bytes);
         assert!(res.is_err());
     }
 
     #[test]
     fn test_parse_connect_packet() {
-        // Paquet MQTT CONNECT valide
         let raw_packet: &[u8] = &[
             0x10, 0x10, // Header: CONNECT (0x10), Remaining Len: 18 (0x12)
             0x00, 0x04, b'M', b'Q', b'T', b'T', // Protocol Name: MQTT
@@ -391,7 +355,6 @@ mod test {
 
     #[test]
     fn test_parse_publish_qos0() {
-        // PUBLISH (QoS 0) sur le topic "temp" avec le payload "22C"
         let raw_packet: &[u8] = &[
             0x30, 0x09, // Header: PUBLISH (QoS 0, Dup 0, Retain 0), Len 9
             0x00, 0x04, b't', b'e', b'm', b'p', // Topic Name: "temp" (6 octets)
@@ -416,7 +379,7 @@ mod test {
 
     #[test]
     fn test_parse_publish_qos1() {
-        // PUBLISH (QoS 1) sur "a", Packet ID = 10, payload = "hi"
+        // PUBLISH (QoS 1) on  "a", Packet ID = 10, payload = "hi"
         let raw_packet: &[u8] = &[
             0x32, 0x07, // Header: PUBLISH QoS 1 (0x30 | 0x02)
             0x00, 0x01, b'a', // Topic Name: "a"
@@ -443,15 +406,11 @@ mod test {
 
     #[test]
     fn test_parse_incomplete_packet() {
-        // Le paquet annonce 10 octets restants mais on en fournit seulement 2
         let raw_packet: &[u8] = &[0x10, 0x0A, 0x00, 0x04];
         let res = ControlPacket::parse(raw_packet);
 
         assert!(res.is_err());
-        assert_eq!(
-            res.unwrap_err(),
-            "Incomplete packet: byte slice is shorter than remaining length"
-        );
+        assert_eq!(res.unwrap_err(), "Incomplete packet");
     }
 
     #[test]
@@ -461,5 +420,90 @@ mod test {
 
         assert!(res.is_err());
         assert_eq!(res.unwrap_err(), "Invalid flag detected");
+    }
+
+    #[test]
+    fn test_read_string_success() {
+        let data: &[u8] = &[0x00, 0x04, b'T', b'e', b's', b't'];
+        let mut reader = BufferReader::new(data);
+
+        let res = reader.read_string().unwrap();
+        assert_eq!(res, "Test");
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn test_read_string_too_short() {
+        let data: &[u8] = &[0x00, 0x05, b'T', b'e', b's', b't'];
+        let mut reader = BufferReader::new(data);
+
+        assert!(reader.read_string().is_err());
+    }
+
+    #[test]
+    fn test_parse_subscribe_payload() {
+        let raw: &[u8] = &[
+            0x00, 0x03, b'a', b'/', b'b', 0x01, 0x00, 0x03, b'c', b'/', b'd', 0x00,
+        ];
+        let mut reader = BufferReader::new(raw);
+
+        let payload = Payload::parse_subscribe(&mut reader).unwrap();
+        if let Payload::Subscribe(filters) = payload {
+            assert_eq!(filters.len(), 2);
+            assert_eq!(filters[0].filter, "a/b");
+            assert_eq!(filters[0].qos, 1);
+            assert_eq!(filters[1].filter, "c/d");
+            assert_eq!(filters[1].qos, 0);
+        } else {
+            panic!("Expected Payload::Subscribe");
+        }
+    }
+
+    #[test]
+    fn test_parse_subscribe_invalid_qos() {
+        let raw: &[u8] = &[0x00, 0x03, b'a', b'/', b'b', 0x03];
+        let mut reader = BufferReader::new(raw);
+        assert!(Payload::parse_subscribe(&mut reader).is_err());
+    }
+
+    #[test]
+    fn test_parse_connect_payload_with_flags() {
+        let flags = ConnectFlag {
+            username_flag: true,
+            password_flag: true,
+            will_retain: false,
+            will_qos: 0,
+            will_flag: true,
+            clean_session: true,
+        };
+
+        let vheader = VariableHeader::Connect {
+            protocol_name: "MQTT".to_string(),
+            protocol_level: 4,
+            connect_flag: flags,
+            keep_alive: 60,
+        };
+
+        // client_id = "client", will_topic = "will", will_msg = "bye", user = "user", pass = "pass"
+        let raw: &[u8] = &[
+            0x00, 0x06, b'c', b'l', b'i', b'e', b'n', b't', // Client ID
+            0x00, 0x04, b'w', b'i', b'l', b'l', // Will Topic
+            0x00, 0x03, b'b', b'y', b'e', // Will Message
+            0x00, 0x04, b'u', b's', b'e', b'r', // Username
+            0x00, 0x04, b'p', b'a', b's', b's', // Password
+        ];
+        let mut reader = BufferReader::new(raw);
+
+        let payload = Payload::parse_connect(&mut reader, &vheader).unwrap();
+
+        if let Payload::Connect(conn_payload) = payload {
+            assert_eq!(conn_payload.client_id, "client");
+            assert_eq!(conn_payload.will_topic.as_deref(), Some("will"));
+            assert_eq!(conn_payload.will_message.as_deref(), Some(&b"bye"[..]));
+            assert_eq!(conn_payload.username.as_deref(), Some("user"));
+            assert_eq!(conn_payload.password.as_deref(), Some(&b"pass"[..]));
+        } else {
+            panic!("Expected Payload::Connect");
+        }
     }
 }

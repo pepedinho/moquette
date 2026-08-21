@@ -30,7 +30,7 @@ pub enum Payload {
 pub enum ControlPacketType {
     Connect = 1,
     Connack,
-    Publish(PublishFlag),
+    Publish,
     Puback,
     Pubrec,
     Pubrel,
@@ -42,6 +42,30 @@ pub enum ControlPacketType {
     Pingreq,
     Pingresp,
     Disconnect,
+}
+
+impl TryFrom<u8> for ControlPacketType {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Connect),
+            2 => Ok(Self::Connack),
+            3 => Ok(Self::Publish),
+            4 => Ok(Self::Puback),
+            5 => Ok(Self::Pubrec),
+            6 => Ok(Self::Pubrel),
+            7 => Ok(Self::Pubcomp),
+            8 => Ok(Self::Subscribe),
+            9 => Ok(Self::Suback),
+            10 => Ok(Self::Unsubscribe),
+            11 => Ok(Self::Unsuback),
+            12 => Ok(Self::Pingreq),
+            13 => Ok(Self::Pingresp),
+            14 => Ok(Self::Disconnect),
+            _ => Err("Control packet type representation must be between 1 and 14"),
+        }
+    }
 }
 
 /// Flag for Pusblish control packet
@@ -57,6 +81,7 @@ pub struct PublishFlag {
 pub struct FixedHeader {
     pub r#type: ControlPacketType,
     pub remaining_length: RemainingLength,
+    pub flags: u8,
 }
 
 #[derive(Debug)]
@@ -93,6 +118,36 @@ pub struct ConnectFlag {
     pub clean_session: bool,
 }
 
+impl TryFrom<u8> for ConnectFlag {
+    type Error = &'static str;
+
+    fn try_from(byte: u8) -> Result<Self, Self::Error> {
+        if (byte & 0x01) != 0 {
+            return Err("Bit 0 of Connect flag must be 0");
+        }
+
+        let will_qos = (byte & 0x18) >> 3;
+        if will_qos > 2 {
+            return Err("Invalid Will QoS level (must be 0, 1 or 2)");
+        }
+
+        let will_flag = (byte & 0x04) != 0;
+
+        if (!will_flag && will_qos != 0) || (!will_flag && (byte & 0x20) != 0) {
+            return Err("Will QoS and Will Retain must be 0 if Will Flag is 0");
+        }
+
+        Ok(ConnectFlag {
+            username_flag: (byte & 0x80) != 0,
+            password_flag: (byte & 0x40) != 0,
+            will_retain: (byte & 0x20) != 0,
+            will_qos,
+            will_flag,
+            clean_session: (byte & 0x02) != 0,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ConnackReturnCode {
@@ -111,192 +166,4 @@ pub enum SubackReturnCode {
     SuccessQoS1 = 0x01,
     SuccessQoS2 = 0x02,
     Failure = 0x80,
-}
-
-fn read_string(bytes: &mut &[u8]) -> Result<String, &'static str> {
-    if bytes.len() < 2 {
-        return Err("Payload too short for string length");
-    }
-    let len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
-    *bytes = &bytes[2..];
-
-    if bytes.len() < len {
-        return Err("Payload too short for string content");
-    }
-
-    let s = std::str::from_utf8(&bytes[..len])
-        .map_err(|_| "Invalid UTF-8 string in payload")?
-        .to_string();
-    *bytes = &bytes[len..];
-    Ok(s)
-}
-
-fn read_bytes(bytes: &mut &[u8]) -> Result<Vec<u8>, &'static str> {
-    if bytes.len() < 2 {
-        return Err("Payload too short for byte array length");
-    }
-    let len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
-    *bytes = &bytes[2..];
-
-    if bytes.len() < len {
-        return Err("Payload too short for byte array content");
-    }
-
-    let data = bytes[..len].to_vec();
-    *bytes = &bytes[len..];
-    Ok(data)
-}
-
-impl ConnectPayload {
-    pub fn from_raw(raw_payload: &mut &[u8], flags: &ConnectFlag) -> Result<Self, &'static str> {
-        let client_id = read_string(raw_payload)?;
-
-        let (will_topic, will_message) = if flags.will_flag {
-            let topic = read_string(raw_payload)?;
-            let msg = read_bytes(raw_payload)?;
-            (Some(topic), Some(msg))
-        } else {
-            (None, None)
-        };
-
-        let username = if flags.username_flag {
-            Some(read_string(raw_payload)?)
-        } else {
-            None
-        };
-
-        let password = if flags.password_flag {
-            Some(read_bytes(raw_payload)?)
-        } else {
-            None
-        };
-
-        let payload = ConnectPayload {
-            client_id,
-            will_topic,
-            will_message,
-            username,
-            password,
-        };
-
-        Ok(payload)
-    }
-}
-
-impl Payload {
-    pub fn parse_subscribe(mut raw: &[u8]) -> Result<Self, &'static str> {
-        let mut filters = Vec::new();
-
-        while !raw.is_empty() {
-            let filter = read_string(&mut raw)?;
-            if raw.is_empty() {
-                return Err("SUBSCRIBE payload truncated before QoS byte");
-            }
-            let qos = raw[0];
-            if qos > 2 {
-                return Err("Invalid QoS level in SUBSCRIBE payload");
-            }
-            raw = &raw[1..];
-            filters.push(TopicFilter { filter, qos });
-        }
-
-        if filters.is_empty() {
-            return Err("SUBSCRIBE payload must contain at least one topic filter");
-        }
-
-        Ok(Payload::Subscribe(filters))
-    }
-
-    pub fn parse_suback(raw: &[u8]) -> Result<Self, &'static str> {
-        if raw.is_empty() {
-            return Err("SUBACK payload cannot be empty");
-        }
-        Ok(Payload::Suback(raw.to_vec()))
-    }
-
-    pub fn parse_unsubscribe(mut raw: &[u8]) -> Result<Self, &'static str> {
-        let mut topics = Vec::new();
-
-        while !raw.is_empty() {
-            let topic = read_string(&mut raw)?;
-            topics.push(topic);
-        }
-
-        if topics.is_empty() {
-            return Err("UNSUBSCRIBE payload must contain at least one topic filter");
-        }
-
-        Ok(Payload::Unsubscribe(topics))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_read_string_success() {
-        let mut data: &[u8] = &[0x00, 0x04, b'T', b'e', b's', b't'];
-        let res = read_string(&mut data).unwrap();
-        assert_eq!(res, "Test");
-        assert!(data.is_empty());
-    }
-
-    #[test]
-    fn test_read_string_too_short() {
-        let mut data: &[u8] = &[0x00, 0x05, b'T', b'e', b's', b't'];
-        assert!(read_string(&mut data).is_err());
-    }
-
-    #[test]
-    fn test_parse_subscribe_payload() {
-        let raw: &[u8] = &[
-            0x00, 0x03, b'a', b'/', b'b', 0x01, 0x00, 0x03, b'c', b'/', b'd', 0x00,
-        ];
-
-        let payload = Payload::parse_subscribe(raw).unwrap();
-        if let Payload::Subscribe(filters) = payload {
-            assert_eq!(filters.len(), 2);
-            assert_eq!(filters[0].filter, "a/b");
-            assert_eq!(filters[0].qos, 1);
-            assert_eq!(filters[1].filter, "c/d");
-            assert_eq!(filters[1].qos, 0);
-        } else {
-            panic!("Expected Payload::Subscribe");
-        }
-    }
-
-    #[test]
-    fn test_parse_subscribe_invalid_qos() {
-        let raw: &[u8] = &[0x00, 0x03, b'a', b'/', b'b', 0x03];
-        assert!(Payload::parse_subscribe(raw).is_err());
-    }
-
-    #[test]
-    fn test_parse_connect_payload_with_flags() {
-        let flags = ConnectFlag {
-            username_flag: true,
-            password_flag: true,
-            will_retain: false,
-            will_qos: 0,
-            will_flag: true,
-            clean_session: true,
-        };
-
-        // client_id = "client", will_topic = "will", will_msg = "bye", user = "user", pass = "pass"
-        let mut raw: &[u8] = &[
-            0x00, 0x06, b'c', b'l', b'i', b'e', b'n', b't', // Client ID
-            0x00, 0x04, b'w', b'i', b'l', b'l', // Will Topic
-            0x00, 0x03, b'b', b'y', b'e', // Will Message
-            0x00, 0x04, b'u', b's', b'e', b'r', // Username
-            0x00, 0x04, b'p', b'a', b's', b's', // Password
-        ];
-
-        let conn_payload = ConnectPayload::from_raw(&mut raw, &flags).unwrap();
-        assert_eq!(conn_payload.client_id, "client");
-        assert_eq!(conn_payload.will_topic.as_deref(), Some("will"));
-        assert_eq!(conn_payload.will_message.as_deref(), Some(&b"bye"[..]));
-        assert_eq!(conn_payload.username.as_deref(), Some("user"));
-        assert_eq!(conn_payload.password.as_deref(), Some(&b"pass"[..]));
-    }
 }
