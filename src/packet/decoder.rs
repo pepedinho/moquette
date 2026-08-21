@@ -1,24 +1,15 @@
 use std::mem::transmute;
 
-/// Control Packet Type representation
-/// they all got a value from 1 to 14
-#[repr(u8)]
-#[derive(PartialEq, Debug)]
-pub enum ControlPacketType {
-    Connect = 1,
-    Connack,
-    Publish(PublishFlag),
-    Puback,
-    Pubrec,
-    Pubrel,
-    Pubcomp,
-    Subscribe,
-    Suback,
-    Unsubscribe,
-    Unsuback,
-    Pingreq,
-    Pingresp,
-    Disconnect,
+use crate::packet::types::{
+    ConnectFlag, ConnectPayload, ControlPacketType, FixedHeader, Payload, PublishFlag,
+    RemainingLength, VariableHeader,
+};
+
+#[derive(Debug)]
+pub struct ControlPacket {
+    pub header: FixedHeader,
+    pub vheader: VariableHeader,
+    pub payload: Payload,
 }
 
 impl TryFrom<u8> for ControlPacketType {
@@ -34,57 +25,6 @@ impl TryFrom<u8> for ControlPacketType {
             Err("Control packet type representation musty be between 1 and 14")
         }
     }
-}
-
-/// Flag for Pusblish control packet
-/// see: https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Table_3.1_-
-#[derive(PartialEq, Debug, Default)]
-pub struct PublishFlag {
-    dup: bool,
-    qos: u8,
-    retain: bool,
-}
-
-pub struct ControlPacket {
-    pub header: FixedHeader,
-    pub vheader: VariableHeader,
-    pub payload: Option<Vec<u8>>,
-}
-
-pub struct FixedHeader {
-    r#type: ControlPacketType,
-    remaining_length: RemainingLength,
-}
-
-pub struct RemainingLength {
-    /// Length found in header.
-    pub l: usize,
-    /// The Bytes on which the length was encoded.
-    pub br: usize,
-}
-
-pub enum VariableHeader {
-    Connect {
-        protocol_name: String,
-        protocol_level: u8,
-        connect_flag: ConnectFlag,
-        keep_alive: u16,
-    },
-    Publish {
-        topic_name: String,
-        packet_id: Option<u16>,
-    },
-    PacketId(u16),
-    None,
-}
-
-pub struct ConnectFlag {
-    pub username_flag: bool,
-    pub password_flag: bool,
-    pub will_retain: bool,
-    pub will_qos: u8,
-    pub will_flag: bool,
-    pub clean_session: bool,
 }
 
 impl TryFrom<u8> for ConnectFlag {
@@ -130,17 +70,26 @@ impl ControlPacket {
         let body = &bytes[offset..total_expected_len];
 
         let (vheader, payload) = match header.r#type {
+            ControlPacketType::Connect => Self::parse_connect_body(body)?,
             ControlPacketType::Publish(ref flags) => Self::parse_publish_body(body, flags)?,
+            ControlPacketType::Subscribe => Self::parse_subscribe_body(body)?,
+            ControlPacketType::Unsubscribe => Self::parse_unsubscribe_body(body)?,
             ControlPacketType::Puback
             | ControlPacketType::Pubrec
             | ControlPacketType::Pubrel
-            | ControlPacketType::Pubcomp
-            | ControlPacketType::Unsuback => Self::parse_id(body)?,
-            ControlPacketType::Subscribe
+            | ControlPacketType::Pubcomp => Self::parse_id(body)?,
+            ControlPacketType::Pingreq | ControlPacketType::Disconnect => {
+                if !body.is_empty() {
+                    return Err("Packet must have remaining length of 0");
+                }
+                (VariableHeader::None, Payload::None)
+            }
+            ControlPacketType::Connack
             | ControlPacketType::Suback
-            | ControlPacketType::Unsubscribe => Self::parse_subscribe_body(body)?,
-            ControlPacketType::Connect => Self::parse_connect_body(body)?,
-            _ => todo!(),
+            | ControlPacketType::Unsuback
+            | ControlPacketType::Pingresp => {
+                return Err("Received server-only packet from client");
+            }
         };
 
         Ok(Self {
@@ -150,37 +99,38 @@ impl ControlPacket {
         })
     }
 
-    fn parse_id(body: &[u8]) -> Result<(VariableHeader, Option<Vec<u8>>), &'static str> {
+    fn parse_id(body: &[u8]) -> Result<(VariableHeader, Payload), &'static str> {
         if body.len() < 2 {
             return Err("Publish body too short for topic length");
         }
 
         let packet_id = u16::from_be_bytes([body[0], body[1]]);
 
-        Ok((VariableHeader::PacketId(packet_id), None))
+        Ok((VariableHeader::PacketId(packet_id), Payload::None))
     }
 
-    fn parse_subscribe_body(
-        body: &[u8],
-    ) -> Result<(VariableHeader, Option<Vec<u8>>), &'static str> {
+    fn parse_subscribe_body(body: &[u8]) -> Result<(VariableHeader, Payload), &'static str> {
         if body.len() < 2 {
-            return Err("SUBSCRIBE body too short");
+            return Err("SUBSCRIBE body too short for packet ID");
         }
         let packet_id = u16::from_be_bytes([body[0], body[1]]);
-        let offset = 2;
-        if offset >= body.len() {
-            return Err("SUBSCRIBE payload must contain at least one topic filter");
+        let payload = Payload::parse_subscribe(&body[2..])?;
+        Ok((VariableHeader::PacketId(packet_id), payload))
+    }
+
+    fn parse_unsubscribe_body(body: &[u8]) -> Result<(VariableHeader, Payload), &'static str> {
+        if body.len() < 2 {
+            return Err("UNSUBSCRIBE body too short for packet ID");
         }
-
-        let payload = body[offset..].to_vec();
-
-        Ok((VariableHeader::PacketId(packet_id), Some(payload)))
+        let packet_id = u16::from_be_bytes([body[0], body[1]]);
+        let payload = Payload::parse_unsubscribe(&body[2..])?;
+        Ok((VariableHeader::PacketId(packet_id), payload))
     }
 
     fn parse_publish_body(
         body: &[u8],
         flags: &PublishFlag,
-    ) -> Result<(VariableHeader, Option<Vec<u8>>), &'static str> {
+    ) -> Result<(VariableHeader, Payload), &'static str> {
         if body.len() < 2 {
             return Err("Publish body too short for topic length");
         }
@@ -212,12 +162,12 @@ impl ControlPacket {
             packet_id,
         };
 
-        let payload = body[offset..].to_vec();
+        let payload = Payload::Publish(body[offset..].to_vec());
 
-        Ok((vheader, Some(payload)))
+        Ok((vheader, payload))
     }
 
-    fn parse_connect_body(body: &[u8]) -> Result<(VariableHeader, Option<Vec<u8>>), &'static str> {
+    fn parse_connect_body(body: &[u8]) -> Result<(VariableHeader, Payload), &'static str> {
         if body.len() < 2 {
             return Err("CONNECT body too short");
         }
@@ -245,7 +195,9 @@ impl ControlPacket {
         let keep_alive = u16::from_be_bytes([body[offset], body[offset + 1]]);
         offset += 2;
 
-        let payload = body[offset..].to_vec();
+        let mut raw_payload = &body[offset..];
+
+        let payload = Payload::Connect(ConnectPayload::from_raw(&mut raw_payload, &connect_flag)?);
 
         Ok((
             VariableHeader::Connect {
@@ -254,7 +206,7 @@ impl ControlPacket {
                 connect_flag,
                 keep_alive,
             },
-            Some(payload),
+            payload,
         ))
     }
 }
@@ -395,5 +347,119 @@ mod test {
         let bytes = &[0x80];
         let res = FixedHeader::decoding_remainin_length(bytes);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_parse_connect_packet() {
+        // Paquet MQTT CONNECT valide
+        let raw_packet: &[u8] = &[
+            0x10, 0x10, // Header: CONNECT (0x10), Remaining Len: 18 (0x12)
+            0x00, 0x04, b'M', b'Q', b'T', b'T', // Protocol Name: MQTT
+            0x04, // Protocol Level: 4 (MQTT v3.1.1)
+            0x02, // Connect Flags: Clean Session = 1
+            0x00, 0x3C, // Keep Alive: 60s
+            0x00, 0x04, b't', b'e', b's', b't', // Client ID: "test"
+        ];
+
+        let packet = ControlPacket::parse(raw_packet).expect("Failed to parse CONNECT packet");
+
+        assert_eq!(packet.header.r#type, ControlPacketType::Connect);
+
+        if let VariableHeader::Connect {
+            protocol_name,
+            protocol_level,
+            keep_alive,
+            connect_flag,
+        } = packet.vheader
+        {
+            assert_eq!(protocol_name, "MQTT");
+            assert_eq!(protocol_level, 4);
+            assert_eq!(keep_alive, 60);
+            assert!(connect_flag.clean_session);
+            assert!(!connect_flag.username_flag);
+        } else {
+            panic!("Expected VariableHeader::Connect");
+        }
+
+        if let Payload::Connect(connect_payload) = packet.payload {
+            assert_eq!(connect_payload.client_id, "test");
+            assert_eq!(connect_payload.username, None);
+        } else {
+            panic!("Expected Payload::Connect");
+        }
+    }
+
+    #[test]
+    fn test_parse_publish_qos0() {
+        // PUBLISH (QoS 0) sur le topic "temp" avec le payload "22C"
+        let raw_packet: &[u8] = &[
+            0x30, 0x09, // Header: PUBLISH (QoS 0, Dup 0, Retain 0), Len 9
+            0x00, 0x04, b't', b'e', b'm', b'p', // Topic Name: "temp" (6 octets)
+            b'2', b'2', b'C', // Payload: "22C" (3 octets)
+        ];
+
+        let packet = ControlPacket::parse(raw_packet).expect("Failed to parse PUBLISH packet");
+
+        if let VariableHeader::Publish {
+            topic_name,
+            packet_id,
+        } = packet.vheader
+        {
+            assert_eq!(topic_name, "temp");
+            assert_eq!(packet_id, None); // No Packet ID with QoS 0
+        } else {
+            panic!("Expected VariableHeader::Publish");
+        }
+
+        assert_eq!(packet.payload, Payload::Publish(b"22C".to_vec()));
+    }
+
+    #[test]
+    fn test_parse_publish_qos1() {
+        // PUBLISH (QoS 1) sur "a", Packet ID = 10, payload = "hi"
+        let raw_packet: &[u8] = &[
+            0x32, 0x07, // Header: PUBLISH QoS 1 (0x30 | 0x02)
+            0x00, 0x01, b'a', // Topic Name: "a"
+            0x00, 0x0A, // Packet ID: 10
+            b'h', b'i', // Payload: "hi"
+        ];
+
+        let packet =
+            ControlPacket::parse(raw_packet).expect("Failed to parse PUBLISH QoS 1 packet");
+
+        if let VariableHeader::Publish {
+            topic_name,
+            packet_id,
+        } = packet.vheader
+        {
+            assert_eq!(topic_name, "a");
+            assert_eq!(packet_id, Some(10));
+        } else {
+            panic!("Expected VariableHeader::Publish");
+        }
+
+        assert_eq!(packet.payload, Payload::Publish(b"hi".to_vec()));
+    }
+
+    #[test]
+    fn test_parse_incomplete_packet() {
+        // Le paquet annonce 10 octets restants mais on en fournit seulement 2
+        let raw_packet: &[u8] = &[0x10, 0x0A, 0x00, 0x04];
+        let res = ControlPacket::parse(raw_packet);
+
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err(),
+            "Incomplete packet: byte slice is shorter than remaining length"
+        );
+    }
+
+    #[test]
+    fn test_invalid_fixed_header_flags() {
+        let raw_packet: &[u8] = &[0x80, 0x00];
+        let res = ControlPacket::parse(raw_packet);
+
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "Invalid flag detected");
     }
 }
