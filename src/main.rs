@@ -1,10 +1,12 @@
 use anyhow::Result;
-use moquette::{config::Config, network};
+use moquette::{broker::state::SharedBroker, config::Config, network};
 use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let config = Config::from_file("configs/moquette.toml").unwrap_or_else(|e| {
         error!("Failed to load config file: {e}");
@@ -13,7 +15,8 @@ async fn main() -> Result<()> {
 
     info!("Config load successfully !");
 
-    network::server::start(config).await?;
+    let broker = SharedBroker::new();
+    network::server::start(config, broker).await?;
 
     Ok(())
 }
