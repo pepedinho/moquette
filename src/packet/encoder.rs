@@ -103,6 +103,7 @@ impl ServerPacket {
                     remaining_len += 2;
                 }
                 encode_remaining_length(remaining_len, buf);
+                encode_utf8_string(topic_name, buf);
 
                 if *qos > 0
                     && let Some(pid) = packet_id
@@ -168,5 +169,24 @@ mod tests {
 
         encode_remaining_length(321, &mut buf);
         assert_eq!(buf, vec![0xC1, 0x02]);
+    }
+
+    #[test]
+    fn test_encode_publish() {
+        let packet = ServerPacket::Publish {
+            topic_name: "a/b".to_string(),
+            packet_id: None,
+            payload: vec![0x01, 0x02],
+            dup: false,
+            qos: 0,
+            retain: false,
+        };
+
+        let expected = vec![
+            0x30, 0x07, // Header (QoS 0) + Remaining Length (7 octets)
+            0x00, 0x03, b'a', b'/', b'b', // Topic name: Length (3) + "a/b"
+            0x01, 0x02, // Payload
+        ];
+        assert_eq!(packet.encode(), expected);
     }
 }
