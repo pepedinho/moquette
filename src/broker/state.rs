@@ -6,15 +6,16 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::info;
 
-use crate::packet::encoder::ServerPacket;
+use crate::{packet::encoder::ServerPacket, snowflake::SnowFlake};
 
 pub type ClientSender = mpsc::Sender<ServerPacket>;
+pub type ClientId = String;
 
 /// Internal protected broker state
 #[derive(Debug, Default)]
 pub struct BrokerState {
     /// This HashMap associate a 'Topic' to a list of senders (subscribed clients)
-    subscriptions: HashMap<String, Vec<ClientSender>>,
+    subscriptions: HashMap<String, HashMap<ClientId, ClientSender>>,
 }
 
 /// This structure act like an envelop that we will clone and
@@ -22,23 +23,23 @@ pub struct BrokerState {
 #[derive(Clone)]
 pub struct SharedBroker {
     state: Arc<RwLock<BrokerState>>,
-}
-
-impl Default for SharedBroker {
-    fn default() -> Self {
-        Self::new()
-    }
+    id_gen: Arc<SnowFlake>,
 }
 
 impl SharedBroker {
-    pub fn new() -> Self {
+    pub fn new(node_id: u64) -> Self {
         Self {
             state: Arc::new(RwLock::new(BrokerState::default())),
+            id_gen: Arc::new(SnowFlake::new(node_id)),
         }
     }
 
+    pub fn generate_client_id(&self) -> String {
+        self.id_gen.generate_client_id()
+    }
+
     /// Register a [`ClientSender`] to a topic
-    pub fn subscribe(&self, topic: String, sender: ClientSender) {
+    pub fn subscribe(&self, client_id: String, topic: String, sender: ClientSender) {
         //INFO: ask autorization to write (blocking)
         //WARN: if previous crashed without unlock the state this will panic
         let mut state = self.state.write().unwrap();
@@ -46,24 +47,40 @@ impl SharedBroker {
 
         //INFO: Add the Sender to this topic's list
         //(or create the list if doesn't exist)
-        state.subscriptions.entry(topic).or_default().push(sender);
+        state
+            .subscriptions
+            .entry(topic)
+            .or_default()
+            .insert(client_id, sender);
     }
 
     /// Send a message to all subscriber of a topic
     pub async fn publish(&self, topic: &str, packet: ServerPacket) {
         //INFO: ask autorization to read current state
         //used a restricted scope to avoid vicious deadlock
-        let subscribers = {
+        let subscribers: Vec<ClientSender> = {
             let state = self.state.read().unwrap();
-            state.subscriptions.get(topic).cloned()
+            state
+                .subscriptions
+                .get(topic)
+                .map(|map| map.values().cloned().collect())
+                .unwrap_or_default()
         };
 
-        //INFO: Fetch the list of current client subscibed to the reqested topic
-        if let Some(subscribers) = subscribers {
-            //INFO: Send a clone of the packet to each subscriber
-            for sender in subscribers {
-                let _ = sender.send(packet.clone()).await;
-            }
+        // send the packet for all subscriber on this topic
+        for sender in subscribers {
+            let _ = sender.send(packet.clone()).await;
         }
+    }
+
+    pub fn unsubscribe_client(&self, client_id: &str) {
+        let mut state = self.state.write().unwrap();
+
+        state.subscriptions.retain(|_topic, subscriber| {
+            subscriber.remove(client_id);
+            !subscriber.is_empty()
+        });
+
+        info!("Cleaning complete for client <{}>", client_id);
     }
 }

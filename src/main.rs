@@ -15,7 +15,8 @@ async fn main() -> Result<()> {
 
     info!("Config load successfully !");
 
-    let broker = SharedBroker::new();
+    let node_id = config.server.node_id.unwrap_or(1);
+    let broker = SharedBroker::new(node_id);
     network::server::start(config, broker).await?;
 
     Ok(())

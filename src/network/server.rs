@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tokio::{net::TcpListener, sync::mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -38,7 +38,24 @@ pub async fn start(config: Config, broker: SharedBroker) -> Result<()> {
 
 async fn handl_client(connection: &mut Connection, broker: SharedBroker) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<ServerPacket>(32);
+    let mut client_id: Option<String> = None;
 
+    let result = run_client_loop(connection, &broker, &tx, &mut rx, &mut client_id).await;
+
+    if let Some(id) = client_id {
+        broker.unsubscribe_client(&id);
+    }
+
+    result
+}
+
+async fn run_client_loop(
+    connection: &mut Connection,
+    broker: &SharedBroker,
+    tx: &mpsc::Sender<ServerPacket>,
+    rx: &mut mpsc::Receiver<ServerPacket>,
+    client_id: &mut Option<String>,
+) -> Result<()> {
     loop {
         tokio::select! {
             Some(packet_to_send) = rx.recv() => {
@@ -51,7 +68,7 @@ async fn handl_client(connection: &mut Connection, broker: SharedBroker) -> Resu
                     None => return Ok(()),
                 };
 
-                handl_packet(packet, connection, &broker, &tx).await?;
+                handl_packet(packet, connection, broker, tx, client_id).await?;
             }
         }
     }
@@ -62,24 +79,42 @@ async fn handl_packet(
     connection: &mut Connection,
     broker: &SharedBroker,
     tx: &mpsc::Sender<ServerPacket>,
+    client_id: &mut Option<String>,
 ) -> Result<()> {
     debug!("Packet received : {:#?}", packet);
 
     match packet.header.r#type {
         ControlPacketType::Connect => {
+            let received_id = match &packet.payload {
+                Payload::Connect(payload) => payload.client_id.clone(),
+                _ => String::new(),
+            };
+
+            let final_id = if received_id.is_empty() {
+                broker.generate_client_id()
+            } else {
+                received_id
+            };
+
+            *client_id = Some(final_id.clone());
             info!("Connection request received. Sending CONNACK...");
+
             let connack = ServerPacket::Connack {
                 session_present: false,
                 return_code: ConnackReturnCode::Accepted,
             };
             connection.write_packet(&connack).await?;
         }
-        ControlPacketType::Subscribe => {
-            info!("Connection request received. Sending SUBACK...");
 
+        ControlPacketType::Subscribe => {
+            let id = client_id
+                .as_ref()
+                .context("SUBSCRIBE received before CONNECT")?;
+
+            info!("Connection request received. Sending SUBACK...");
             if let Payload::Subscribe(payload) = packet.payload {
                 for topic in payload {
-                    broker.subscribe(topic.filter, tx.clone());
+                    broker.subscribe(id.clone(), topic.filter, tx.clone());
                 }
 
                 let suback = ServerPacket::Suback {
@@ -91,6 +126,7 @@ async fn handl_packet(
                 bail!("Incorrect payload");
             }
         }
+
         ControlPacketType::Publish => {
             if let (
                 VariableHeader::Publish {
