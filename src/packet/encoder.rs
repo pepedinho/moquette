@@ -1,6 +1,6 @@
 use crate::packet::types::{ConnackReturnCode, SubackReturnCode};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ServerPacket {
     Connack {
         session_present: bool,

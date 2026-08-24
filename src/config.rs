@@ -8,6 +8,7 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub max_connections: usize,
+    pub node_id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
