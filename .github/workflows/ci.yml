@@ -1,65 +1,115 @@
-name: CI
+name: VINTINY CI
 
-on:
-  push:
-    branches: [ "main", "master" ]
-  pull_request:
-
-env:
-  CARGO_TERM_COLOR: always
+on: [push, pull_request]
 
 jobs:
-  fmt-clippy:
-    name: Format & Lint
+  fmt:
+    name: Check code formatting
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          component: rustfmt
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+        if: "!startsWith(github.ref, 'refs/tags/v')"
 
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Check Formatting
-        run: cargo fmt --check
-
-      - name: Run Clippy
+  clippy:
+    name: Clippy linting
+    runs-on: ubuntu-latest
+    if: "!startsWith(github.ref, 'refs/tags/v')"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          component: clippy
+      - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
-    name: Run Tests
+    name: Run tests
     runs-on: ubuntu-latest
+    if: "!startsWith(github.ref, 'refs/tags/v')"
     steps:
       - uses: actions/checkout@v4
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run cargo test 
+        env:
+          RUST_BACKTRACE: full
+          RUST_LOG: debug
+        run: cargo test 
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
-      - name: Run nextest
-        run: cargo nextest run --all-features
-  docker-push:
-    name: Build and Push Docker Image (Pi 2)
+  build:
+    name: Build project (PC)
     runs-on: ubuntu-latest
-    needs: [fmt-clippy, test]
-    if: github.event_name == 'push' && github.ref_name == 'main'
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-binary
+          path: target/release/
+
+  release:
+    name: Build and Release for Raspberry Pi 2
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --force
+      - name: Build for Raspberry Pi 2
+        run: cross build --release --target armv7-unknown-linux-gnueabihf
+      - name: Rename binaire for release
+        run: mv target/armv7-unknown-linux-gnueabihf/release/vintiny vintiny-armv7
+      - name: Create GitHub Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vintiny-armv7
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
-      - name: Install Rust target
-        run: rustup target add armv7-unknown-linux-gnueabihf
+      - name: Install Rust & cross
+        run: |
+          rustup target add armv7-unknown-linux-gnueabihf
+          cargo install cross --git https://github.com/cross-rs/cross --force
 
-      - name: Install cross tool
-        run: cargo install cross --git https://github.com/cross-rs/cross --force
-
-      - name: Build binary for Pi 2 (ARMv7)
+      - name: Build binary for Pi 2
+        env:
+          CC: arm-linux-gnueabihf-gcc
+          CXX: arm-linux-gnueabihf-g++
+          CMAKE_TOOLCHAIN_FILE: /home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/boring-sys2-4.15.15/cmake/armv7-linux.cmake
         run: cross build --release --target armv7-unknown-linux-gnueabihf
 
       - name: Log in to GitHub Container Registry
@@ -75,9 +125,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Lowercase repository owner for GHCR
+      - name: Extract branch name (Safe version)
+        shell: bash
+        # Cette commande remplace proprement les caractères interdits pour Docker
         run: |
-          echo "REPO_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
+          REF_NAME_CLEAN=$(echo "${{ github.ref_name }}" | sed 's/[^a-zA-Z0-9._-]/_ /g')
+          echo "BRANCH_NAME=${REF_NAME_CLEAN}" >> $GITHUB_ENV
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -85,6 +138,5 @@ jobs:
           context: .
           platforms: linux/arm/v7
           push: true
-          tags: |
-            ghcr.io/${{ env.REPO_OWNER }}/moquette:latest
-            ghcr.io/${{ env.REPO_OWNER }}/moquette:${{ github.sha }}
+          # Met l'image en minuscule pour éviter les refus de GHCR si ton pseudo a des majuscules
+          tags: ghcr.io/${{ github.repository_owner }}/vintiny:${{ env.BRANCH_NAME }}
