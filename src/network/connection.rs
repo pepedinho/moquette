@@ -1,48 +1,48 @@
 use anyhow::{Result, anyhow};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    io::AsyncWriteExt,
+    net::{
+        TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
+};
+use tokio_stream::StreamExt;
+use tokio_util::codec::FramedRead;
+
+use crate::{
+    network::codec::MqttCodec,
+    packet::{decoder::ControlPacket, encoder::ServerPacket},
 };
 
-use crate::packet::{decoder::ControlPacket, encoder::ServerPacket};
-
 pub struct Connection {
-    stream: TcpStream,
-    buffer: [u8; 4096],
+    reader: FramedRead<OwnedReadHalf, MqttCodec>,
+    writer: OwnedWriteHalf,
 }
 
 impl Connection {
     pub fn new(stream: TcpStream) -> Self {
+        let (read_half, write_half) = stream.into_split();
         Self {
-            stream,
-            buffer: [0; 4096],
+            reader: FramedRead::new(read_half, MqttCodec),
+            writer: write_half,
         }
     }
 
     pub async fn read_packet(&mut self) -> Result<Option<ControlPacket>> {
-        let bytes_read = self
-            .stream
-            .read(&mut self.buffer)
-            .await
-            .map_err(|e| anyhow!(e))?;
-
-        if bytes_read == 0 {
-            return Ok(None);
-        }
-
-        match ControlPacket::parse(&self.buffer[..bytes_read]) {
-            Ok(packet) => Ok(Some(packet)),
-            Err(e) => Err(anyhow!(e)),
+        match self.reader.next().await {
+            Some(Ok(packet)) => Ok(Some(packet)),
+            Some(Err(e)) => Err(anyhow!(e)),
+            None => Ok(None),
         }
     }
 
     pub async fn write_packet(&mut self, packet: &ServerPacket) -> Result<()> {
         let bytes = packet.encode();
-        self.stream
+        self.writer
             .write_all(&bytes)
             .await
             .map_err(|e| anyhow!(e))?;
-        self.stream.flush().await?;
+        self.writer.flush().await.map_err(|e| anyhow!(e))?;
         Ok(())
     }
 }

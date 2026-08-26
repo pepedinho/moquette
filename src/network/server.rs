@@ -36,7 +36,7 @@ pub async fn start(config: Config, broker: SharedBroker) -> Result<()> {
     }
 }
 
-async fn handl_client(connection: &mut Connection, broker: SharedBroker) -> Result<()> {
+pub async fn handl_client(connection: &mut Connection, broker: SharedBroker) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<ServerPacket>(32);
     let mut client_id: Option<String> = None;
 
