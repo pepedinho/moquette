@@ -3,7 +3,7 @@ use std::fs;
 use anyhow::{Ok, Result};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -11,7 +11,7 @@ pub struct ServerConfig {
     pub node_id: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct Config {
     pub server: ServerConfig,
 }

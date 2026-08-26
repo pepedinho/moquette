@@ -6,7 +6,7 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::info;
 
-use crate::{packet::encoder::ServerPacket, snowflake::SnowFlake};
+use crate::{broker::topic_tree::TopicTree, packet::encoder::ServerPacket, snowflake::SnowFlake};
 
 pub type ClientSender = mpsc::Sender<ServerPacket>;
 pub type ClientId = String;
@@ -15,7 +15,7 @@ pub type ClientId = String;
 #[derive(Debug, Default)]
 pub struct BrokerState {
     /// This HashMap associate a 'Topic' to a list of senders (subscribed clients)
-    subscriptions: HashMap<String, HashMap<ClientId, ClientSender>>,
+    subscriptions: TopicTree,
 }
 
 /// This structure act like an envelop that we will clone and
@@ -47,40 +47,44 @@ impl SharedBroker {
 
         //INFO: Add the Sender to this topic's list
         //(or create the list if doesn't exist)
-        state
-            .subscriptions
-            .entry(topic)
-            .or_default()
-            .insert(client_id, sender);
+        state.subscriptions.insert(&topic, client_id, sender);
     }
 
     /// Send a message to all subscriber of a topic
     pub async fn publish(&self, topic: &str, packet: ServerPacket) {
         //INFO: ask autorization to read current state
         //used a restricted scope to avoid vicious deadlock
-        let subscribers: Vec<ClientSender> = {
+        let subscribers: HashMap<ClientId, ClientSender> = {
             let state = self.state.read().unwrap();
-            state
-                .subscriptions
-                .get(topic)
-                .map(|map| map.values().cloned().collect())
-                .unwrap_or_default()
+            // state
+            //     .subscriptions
+            //     .get(topic)
+            //     .map(|map| map.values().cloned().collect())
+            //     .unwrap_or_default()
+            state.subscriptions.get_match(topic)
         };
 
         // send the packet for all subscriber on this topic
-        for sender in subscribers {
+        for (_client_id, sender) in subscribers {
             let _ = sender.send(packet.clone()).await;
         }
     }
 
-    pub fn unsubscribe_client(&self, client_id: &str) {
+    pub fn unsubscribe(&self, client_id: &str, topic: &str) {
         let mut state = self.state.write().unwrap();
+        state
+            .subscriptions
+            .unsubscribe(topic, &client_id.to_string());
 
-        state.subscriptions.retain(|_topic, subscriber| {
-            subscriber.remove(client_id);
-            !subscriber.is_empty()
-        });
+        info!("Client <{}> unsubscribed from topic: {}", client_id, topic);
+    }
 
-        info!("Cleaning complete for client <{}>", client_id);
+    pub fn disconnect(&self, client_id: &str) {
+        let mut state = self.state.write().unwrap();
+        state.subscriptions.remove(&client_id.to_string());
+        info!(
+            "Client <{}> disconnected, all subscriptions removed",
+            client_id
+        );
     }
 }
