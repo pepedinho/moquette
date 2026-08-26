@@ -4,7 +4,7 @@ use std::{
 };
 
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{broker::topic_tree::TopicTree, packet::encoder::ServerPacket, snowflake::SnowFlake};
 
@@ -65,8 +65,10 @@ impl SharedBroker {
         };
 
         // send the packet for all subscriber on this topic
-        for (_client_id, sender) in subscribers {
-            let _ = sender.send(packet.clone()).await;
+        for (client_id, sender) in subscribers {
+            if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(packet.clone()) {
+                warn!("Client <{client_id}> buffer is full, message dropped");
+            }
         }
     }
 
