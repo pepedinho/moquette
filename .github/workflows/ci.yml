@@ -1,4 +1,4 @@
-name: VINTINY CI
+name: Moquette CI
 
 on: [push, pull_request]
 
@@ -81,11 +81,11 @@ jobs:
       - name: Build for Raspberry Pi 2
         run: cross build --release --target armv7-unknown-linux-gnueabihf
       - name: Rename binaire for release
-        run: mv target/armv7-unknown-linux-gnueabihf/release/vintiny vintiny-armv7
+        run: mv target/armv7-unknown-linux-gnueabihf/release/moquette moquette-armv7
       - name: Create GitHub Release and Upload Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: vintiny-armv7
+          files: moquette-armv7
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -127,7 +127,6 @@ jobs:
 
       - name: Extract branch name (Safe version)
         shell: bash
-        # Cette commande remplace proprement les caractères interdits pour Docker
         run: |
           REF_NAME_CLEAN=$(echo "${{ github.ref_name }}" | sed 's/[^a-zA-Z0-9._-]/_ /g')
           echo "BRANCH_NAME=${REF_NAME_CLEAN}" >> $GITHUB_ENV
@@ -139,4 +138,4 @@ jobs:
           platforms: linux/arm/v7
           push: true
           # Met l'image en minuscule pour éviter les refus de GHCR si ton pseudo a des majuscules
-          tags: ghcr.io/${{ github.repository_owner }}/vintiny:${{ env.BRANCH_NAME }}
+          tags: ghcr.io/${{ github.repository_owner }}/moquette:${{ env.BRANCH_NAME }}
