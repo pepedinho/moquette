@@ -1,4 +1,5 @@
 use crate::packet::{
+    error::ParseError,
     reader::BufferReader,
     types::{
         ConnectFlag, ConnectPayload, ControlPacketType, FixedHeader, Payload, RemainingLength,
@@ -14,21 +15,24 @@ pub struct ControlPacket {
 }
 
 impl ControlPacket {
-    pub fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
-        let (header, vheader, payload) = decode_client_packet(bytes)?;
-        Ok(Self {
-            header,
-            vheader,
-            payload,
-        })
+    pub fn parse(bytes: &[u8]) -> Result<(Self, usize), ParseError> {
+        let (header, vheader, payload, total_len) = decode_client_packet(bytes)?;
+        Ok((
+            Self {
+                header,
+                vheader,
+                payload,
+            },
+            total_len,
+        ))
     }
 }
 
 pub fn decode_client_packet(
     bytes: &[u8],
-) -> Result<(FixedHeader, VariableHeader, Payload), &'static str> {
+) -> Result<(FixedHeader, VariableHeader, Payload, usize), ParseError> {
     if bytes.is_empty() {
-        return Err("Empty buffer");
+        return Err(ParseError::Invalid("Empty buffer"));
     }
 
     let fixed_header = FixedHeader::from_bytes(bytes)?;
@@ -37,7 +41,7 @@ pub fn decode_client_packet(
     let total_len = header_len + fixed_header.remaining_length.l;
 
     if bytes.len() < total_len {
-        return Err("Incomplete packet");
+        return Err(ParseError::Incomplete);
     }
 
     let body_bytes = &bytes[header_len..total_len];
@@ -74,16 +78,22 @@ pub fn decode_client_packet(
         ControlPacketType::Pingreq | ControlPacketType::Disconnect => {
             (VariableHeader::None, Payload::None)
         }
-        _ => return Err("Unexpected or unsupported control packet type"),
+        _ => {
+            return Err(ParseError::Invalid(
+                "Unexpected or unsupported control packet type",
+            ));
+        }
     };
 
-    Ok((fixed_header, variable_header, payload))
+    Ok((fixed_header, variable_header, payload, total_len))
 }
 
 impl FixedHeader {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, &'static str> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
         if bytes.is_empty() {
-            return Err("Empty buffer: cannot parse fixed header");
+            return Err(ParseError::Invalid(
+                "Empty buffer: cannot parse fixed header",
+            ));
         }
 
         let byte0 = bytes[0];
@@ -98,12 +108,12 @@ impl FixedHeader {
             | ControlPacketType::Subscribe
             | ControlPacketType::Unsubscribe => {
                 if flags != 2 {
-                    return Err("Invalid flag detected");
+                    return Err("Invalid flag detected".into());
                 }
             }
             _ => {
                 if flags != 0 {
-                    return Err("Invalid flag detected");
+                    return Err("Invalid flag detected".into());
                 }
             }
         }
@@ -118,17 +128,19 @@ impl FixedHeader {
     }
 }
 
-fn parse_remaining_length(bytes: &[u8]) -> Result<RemainingLength, &'static str> {
+fn parse_remaining_length(bytes: &[u8]) -> Result<RemainingLength, ParseError> {
     let mut value: usize = 0;
     let mut multiplier = 1;
     let mut bytes_read = 0;
     loop {
         if bytes_read >= bytes.len() {
-            return Err("Incomplete remaining length data");
+            return Err(ParseError::Incomplete);
         }
 
         if bytes_read >= 4 {
-            return Err("Malformed remaining length: exceeds 4 bytes");
+            return Err(ParseError::Invalid(
+                "Malformed remaining length: exceeds 4 bytes",
+            ));
         }
 
         let encoded_byte = bytes[bytes_read];
@@ -327,14 +339,14 @@ mod test {
 
         let packet = ControlPacket::parse(raw_packet).expect("Failed to parse CONNECT packet");
 
-        assert_eq!(packet.header.r#type, ControlPacketType::Connect);
+        assert_eq!(packet.0.header.r#type, ControlPacketType::Connect);
 
         if let VariableHeader::Connect {
             protocol_name,
             protocol_level,
             keep_alive,
             connect_flag,
-        } = packet.vheader
+        } = packet.0.vheader
         {
             assert_eq!(protocol_name, "MQTT");
             assert_eq!(protocol_level, 4);
@@ -345,7 +357,7 @@ mod test {
             panic!("Expected VariableHeader::Connect");
         }
 
-        if let Payload::Connect(connect_payload) = packet.payload {
+        if let Payload::Connect(connect_payload) = packet.0.payload {
             assert_eq!(connect_payload.client_id, "test");
             assert_eq!(connect_payload.username, None);
         } else {
@@ -366,7 +378,7 @@ mod test {
         if let VariableHeader::Publish {
             topic_name,
             packet_id,
-        } = packet.vheader
+        } = packet.0.vheader
         {
             assert_eq!(topic_name, "temp");
             assert_eq!(packet_id, None); // No Packet ID with QoS 0
@@ -374,7 +386,7 @@ mod test {
             panic!("Expected VariableHeader::Publish");
         }
 
-        assert_eq!(packet.payload, Payload::Publish(b"22C".to_vec()));
+        assert_eq!(packet.0.payload, Payload::Publish(b"22C".to_vec()));
     }
 
     #[test]
@@ -393,7 +405,7 @@ mod test {
         if let VariableHeader::Publish {
             topic_name,
             packet_id,
-        } = packet.vheader
+        } = packet.0.vheader
         {
             assert_eq!(topic_name, "a");
             assert_eq!(packet_id, Some(10));
@@ -401,7 +413,7 @@ mod test {
             panic!("Expected VariableHeader::Publish");
         }
 
-        assert_eq!(packet.payload, Payload::Publish(b"hi".to_vec()));
+        assert_eq!(packet.0.payload, Payload::Publish(b"hi".to_vec()));
     }
 
     #[test]
@@ -410,7 +422,7 @@ mod test {
         let res = ControlPacket::parse(raw_packet);
 
         assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), "Incomplete packet");
+        assert_eq!(res.unwrap_err(), ParseError::Incomplete);
     }
 
     #[test]
@@ -419,7 +431,7 @@ mod test {
         let res = ControlPacket::parse(raw_packet);
 
         assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), "Invalid flag detected");
+        assert_eq!(res.unwrap_err(), "Invalid flag detected".into());
     }
 
     #[test]
