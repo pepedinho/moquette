@@ -43,7 +43,7 @@ async fn handl_client(connection: &mut Connection, broker: SharedBroker) -> Resu
     let result = run_client_loop(connection, &broker, &tx, &mut rx, &mut client_id).await;
 
     if let Some(id) = client_id {
-        broker.unsubscribe_client(&id);
+        broker.disconnect(&id);
     }
 
     result
@@ -111,19 +111,57 @@ async fn handl_packet(
                 .as_ref()
                 .context("SUBSCRIBE received before CONNECT")?;
 
-            info!("Connection request received. Sending SUBACK...");
+            let packet_id = match packet.vheader {
+                VariableHeader::PacketId(packet_id) => packet_id,
+                _ => bail!("Incorrect variable header for SUBSCRIBE"),
+            };
+
             if let Payload::Subscribe(payload) = packet.payload {
+                info!(
+                    "Processing SUBSCRIBE for client <{}> on {} topic(s)",
+                    id,
+                    payload.len()
+                );
+
+                let mut return_codes = Vec::with_capacity(payload.len());
                 for topic in payload {
                     broker.subscribe(id.clone(), topic.filter, tx.clone());
+                    return_codes.push(SubackReturnCode::SuccessQoS0);
                 }
 
                 let suback = ServerPacket::Suback {
-                    packet_id: 1,
-                    return_code: vec![SubackReturnCode::SuccessQoS0],
+                    packet_id,
+                    return_code: return_codes,
                 };
                 connection.write_packet(&suback).await?;
             } else {
                 bail!("Incorrect payload");
+            }
+        }
+
+        ControlPacketType::Unsubscribe => {
+            let id = client_id
+                .as_ref()
+                .context("UNSUBSCRIBE received before CONNECT")?;
+
+            let packet_id = match packet.vheader {
+                VariableHeader::PacketId(packet_id) => packet_id,
+                _ => bail!("Incorrect variable header for UNSUBSCRIBE"),
+            };
+
+            if let Payload::Unsubscribe(topics) = packet.payload {
+                info!(
+                    "Processing UNSUBSCRIBE for client <{}> on {} topic(s)",
+                    id,
+                    topics.len()
+                );
+
+                for topic in topics {
+                    broker.unsubscribe(id, &topic);
+                }
+
+                let unsuback = ServerPacket::Unsuback { packet_id };
+                connection.write_packet(&unsuback).await?;
             }
         }
 

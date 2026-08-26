@@ -42,6 +42,7 @@ impl Connection {
             .write_all(&bytes)
             .await
             .map_err(|e| anyhow!(e))?;
+        self.stream.flush().await?;
         Ok(())
     }
 }

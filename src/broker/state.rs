@@ -70,10 +70,21 @@ impl SharedBroker {
         }
     }
 
-    pub fn unsubscribe_client(&self, client_id: &str) {
+    pub fn unsubscribe(&self, client_id: &str, topic: &str) {
+        let mut state = self.state.write().unwrap();
+        state
+            .subscriptions
+            .unsubscribe(topic, &client_id.to_string());
+
+        info!("Client <{}> unsubscribed from topic: {}", client_id, topic);
+    }
+
+    pub fn disconnect(&self, client_id: &str) {
         let mut state = self.state.write().unwrap();
         state.subscriptions.remove(&client_id.to_string());
-
-        info!("Cleaning complete for client <{}>", client_id);
+        info!(
+            "Client <{}> disconnected, all subscriptions removed",
+            client_id
+        );
     }
 }

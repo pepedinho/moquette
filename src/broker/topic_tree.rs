@@ -89,6 +89,46 @@ impl TopicNode {
         matches
     }
 
+    pub fn unsubscribe(&mut self, path: &str, client_id: &ClientId) {
+        if let Some((segment, rest)) = path.split_once('/') {
+            match segment {
+                "+" => {
+                    if let Some(child) = &mut self.wildcard_single {
+                        child.unsubscribe(rest, client_id);
+                        if child.is_empty() {
+                            self.wildcard_single = None;
+                        }
+                    }
+                }
+                "#" => {}
+                _ => {
+                    if let Some(child) = self.childrens.get_mut(segment) {
+                        child.unsubscribe(rest, client_id);
+                    }
+                    self.childrens.retain(|_, child| !child.is_empty());
+                }
+            }
+        } else {
+            let target = match path {
+                "+" => self.wildcard_single.as_deref_mut(),
+                "#" => self.wildcard_multi.as_deref_mut(),
+                _ => self.childrens.get_mut(path),
+            };
+
+            if let Some(child) = target {
+                child.subscribers.remove(client_id);
+            }
+
+            if self.wildcard_single.as_ref().is_none_or(|c| c.is_empty()) {
+                self.wildcard_single = None;
+            }
+            if self.wildcard_multi.as_ref().is_none_or(|c| c.is_empty()) {
+                self.wildcard_multi = None;
+            }
+            self.childrens.retain(|_, child| !child.is_empty());
+        }
+    }
+
     pub fn remove(&mut self, client_id: &ClientId) {
         self.subscribers.remove(client_id);
 
@@ -310,5 +350,55 @@ mod tests {
         assert!(tree.childrens.is_empty());
         assert!(tree.wildcard_single.is_none());
         assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_unsubscribe_specific_topic_keeps_other_subscriptions() {
+        let mut tree = TopicNode::default();
+        let sender = create_dummy_sender();
+        let client = "client_1".to_string();
+
+        tree.insert("home/livingroom/temp", client.clone(), sender.clone());
+        tree.insert("home/kitchen/temp", client.clone(), sender);
+
+        tree.unsubscribe("home/livingroom/temp", &client);
+
+        assert!(tree.get_match("home/livingroom/temp").is_empty());
+
+        let matches_kitchen = tree.get_match("home/kitchen/temp");
+        assert_eq!(matches_kitchen.len(), 1);
+        assert!(matches_kitchen.contains_key(&client));
+    }
+
+    #[test]
+    fn test_unsubscribe_wildcards() {
+        let mut tree = TopicNode::default();
+        let sender = create_dummy_sender();
+        let client = "client_1".to_string();
+
+        tree.insert("sensors/+", client.clone(), sender.clone());
+        tree.insert("alerts/#", client.clone(), sender);
+
+        tree.unsubscribe("sensors/+", &client);
+        tree.unsubscribe("alerts/#", &client);
+
+        assert!(tree.get_match("sensors/temperature").is_empty());
+        assert!(tree.get_match("alerts/critical/cpu").is_empty());
+
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_unsubscribe_non_existent_topic_does_not_panic() {
+        let mut tree = TopicNode::default();
+        let sender = create_dummy_sender();
+        let client = "client_1".to_string();
+
+        tree.insert("home/temp", client.clone(), sender);
+
+        tree.unsubscribe("home/humidity", &client);
+        tree.unsubscribe("unknown/topic/path", &client);
+
+        assert_eq!(tree.get_match("home/temp").len(), 1);
     }
 }
