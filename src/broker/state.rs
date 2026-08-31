@@ -48,13 +48,7 @@ impl SharedBroker {
     }
 
     /// Register a [`ClientSender`] to a topic
-    pub fn subscribe(
-        &self,
-        client_id: String,
-        topic: String,
-        sender: ClientSender,
-        max_qos: u8,
-    ) {
+    pub fn subscribe(&self, client_id: String, topic: String, sender: ClientSender, max_qos: u8) {
         //INFO: ask autorization to write (blocking)
         //WARN: if previous crashed without unlock the state this will panic
         let mut state = self.state.write().unwrap();
@@ -105,8 +99,7 @@ impl SharedBroker {
                 other => other.clone(),
             };
 
-            if let Err(mpsc::error::TrySendError::Full(_)) =
-                subscription.sender.try_send(forwarded)
+            if let Err(mpsc::error::TrySendError::Full(_)) = subscription.sender.try_send(forwarded)
             {
                 warn!("Client <{client_id}> buffer is full, message dropped");
             }
