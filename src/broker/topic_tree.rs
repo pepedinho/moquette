@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use crate::broker::state::{ClientId, ClientSender};
+use crate::broker::state::{ClientId, ClientSubscription};
 
 pub type TopicTree = TopicNode;
 
 #[derive(Default, Debug)]
 pub struct TopicNode {
-    subscribers: HashMap<ClientId, ClientSender>,
+    subscribers: HashMap<ClientId, ClientSubscription>,
     childrens: HashMap<String, TopicNode>,
 
     wildcard_single: Option<Box<TopicNode>>,
@@ -23,40 +23,40 @@ impl TopicNode {
         }
     }
 
-    pub fn insert(&mut self, path: &str, client_id: ClientId, sender: ClientSender) {
+    pub fn insert(&mut self, path: &str, client_id: ClientId, subscription: ClientSubscription) {
         if let Some(parts) = path.split_once('/') {
             match parts.0 {
                 "+" => {
                     let child = self.wildcard_single.get_or_insert_with(Box::default);
-                    child.insert(parts.1, client_id, sender);
+                    child.insert(parts.1, client_id, subscription);
                 }
                 "#" => {
                     //INFO : incorrect MQTT syntax ('#' must be the last segment)
                 }
                 _ => {
                     let child = self.childrens.entry(parts.0.to_string()).or_default();
-                    child.insert(parts.1, client_id, sender);
+                    child.insert(parts.1, client_id, subscription);
                 }
             }
         } else {
             match path {
                 "+" => {
                     let child = self.wildcard_single.get_or_insert_with(Box::default);
-                    child.subscribers.insert(client_id, sender);
+                    child.subscribers.insert(client_id, subscription);
                 }
                 "#" => {
                     let child = self.wildcard_multi.get_or_insert_with(Box::default);
-                    child.subscribers.insert(client_id, sender);
+                    child.subscribers.insert(client_id, subscription);
                 }
                 _ => {
                     let child = self.childrens.entry(path.to_string()).or_default();
-                    child.subscribers.insert(client_id, sender);
+                    child.subscribers.insert(client_id, subscription);
                 }
             }
         }
     }
 
-    pub fn get_match(&self, path: &str) -> HashMap<ClientId, ClientSender> {
+    pub fn get_match(&self, path: &str) -> HashMap<ClientId, ClientSubscription> {
         let mut matches = HashMap::new();
         if let Some(multi) = &self.wildcard_multi {
             matches.extend(multi.subscribers.clone());
@@ -165,15 +165,18 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    fn create_dummy_sender() -> ClientSender {
+    fn create_dummy_subscription() -> ClientSubscription {
         let (tx, _rx) = mpsc::channel(10);
-        tx
+        ClientSubscription {
+            sender: tx,
+            max_qos: 0,
+        }
     }
 
     #[test]
     fn test_exact_match_single_level() {
         let mut tree = TopicNode::default();
-        let sender = create_dummy_sender();
+        let sender = create_dummy_subscription();
 
         tree.insert("home", "client_1".to_string(), sender);
 
@@ -187,7 +190,7 @@ mod tests {
     #[test]
     fn test_exact_match_multi_level() {
         let mut tree = TopicNode::default();
-        let sender = create_dummy_sender();
+        let sender = create_dummy_subscription();
 
         tree.insert("home/livingroom/temp", "client_1".to_string(), sender);
 
@@ -199,8 +202,8 @@ mod tests {
     #[test]
     fn test_branch_isolation() {
         let mut tree = TopicNode::default();
-        let sender1 = create_dummy_sender();
-        let sender2 = create_dummy_sender();
+        let sender1 = create_dummy_subscription();
+        let sender2 = create_dummy_subscription();
 
         tree.insert("home", "client_1".to_string(), sender1);
         tree.insert("home/sensors", "client_2".to_string(), sender2);
@@ -217,8 +220,8 @@ mod tests {
     #[test]
     fn test_multiple_subscribers_same_topic() {
         let mut tree = TopicNode::default();
-        let sender1 = create_dummy_sender();
-        let sender2 = create_dummy_sender();
+        let sender1 = create_dummy_subscription();
+        let sender2 = create_dummy_subscription();
 
         tree.insert("home/sensors", "client_1".to_string(), sender1);
         tree.insert("home/sensors", "client_2".to_string(), sender2);
@@ -232,8 +235,8 @@ mod tests {
     #[test]
     fn test_remove_client() {
         let mut tree = TopicNode::default();
-        let sender1 = create_dummy_sender();
-        let sender2 = create_dummy_sender();
+        let sender1 = create_dummy_subscription();
+        let sender2 = create_dummy_subscription();
 
         tree.insert("home", "client_1".to_string(), sender1.clone());
         tree.insert("home/sensors", "client_1".to_string(), sender1);
@@ -251,7 +254,7 @@ mod tests {
     #[test]
     fn test_single_level_wildcard_plus() {
         let mut tree = TopicNode::default();
-        let sender = create_dummy_sender();
+        let sender = create_dummy_subscription();
 
         tree.insert("home/+/temp", "client_plus".to_string(), sender.clone());
         tree.insert("home/livingroom/temp", "client_exact".to_string(), sender);
@@ -272,7 +275,7 @@ mod tests {
     #[test]
     fn test_multi_level_wildcard_hash() {
         let mut tree = TopicNode::default();
-        let sender = create_dummy_sender();
+        let sender = create_dummy_subscription();
 
         tree.insert("home/#", "client_hash".to_string(), sender);
 
@@ -286,7 +289,7 @@ mod tests {
     #[test]
     fn test_combined_wildcards_and_exact() {
         let mut tree = TopicNode::default();
-        let sender = create_dummy_sender();
+        let sender = create_dummy_subscription();
 
         tree.insert("#", "client_all".to_string(), sender.clone());
         tree.insert("home/+", "client_plus".to_string(), sender.clone());
@@ -306,7 +309,7 @@ mod tests {
     #[test]
     fn test_invalid_hash_position_ignored() {
         let mut tree = TopicNode::default();
-        let sender = create_dummy_sender();
+        let sender = create_dummy_subscription();
 
         tree.insert("home/#/temp", "client_invalid".to_string(), sender);
 
@@ -316,7 +319,7 @@ mod tests {
     #[test]
     fn test_remove_client_from_wildcards() {
         let mut tree = TopicNode::default();
-        let sender = create_dummy_sender();
+        let sender = create_dummy_subscription();
 
         tree.insert("home/+", "client_1".to_string(), sender.clone());
         tree.insert("sensors/#", "client_1".to_string(), sender.clone());
@@ -334,7 +337,7 @@ mod tests {
     #[test]
     fn test_tree_pruning_on_remove() {
         let mut tree = TopicNode::default();
-        let sender = create_dummy_sender();
+        let sender = create_dummy_subscription();
 
         tree.insert(
             "home/livingroom/temp",
@@ -355,7 +358,7 @@ mod tests {
     #[test]
     fn test_unsubscribe_specific_topic_keeps_other_subscriptions() {
         let mut tree = TopicNode::default();
-        let sender = create_dummy_sender();
+        let sender = create_dummy_subscription();
         let client = "client_1".to_string();
 
         tree.insert("home/livingroom/temp", client.clone(), sender.clone());
@@ -373,7 +376,7 @@ mod tests {
     #[test]
     fn test_unsubscribe_wildcards() {
         let mut tree = TopicNode::default();
-        let sender = create_dummy_sender();
+        let sender = create_dummy_subscription();
         let client = "client_1".to_string();
 
         tree.insert("sensors/+", client.clone(), sender.clone());
@@ -391,7 +394,7 @@ mod tests {
     #[test]
     fn test_unsubscribe_non_existent_topic_does_not_panic() {
         let mut tree = TopicNode::default();
-        let sender = create_dummy_sender();
+        let sender = create_dummy_subscription();
         let client = "client_1".to_string();
 
         tree.insert("home/temp", client.clone(), sender);
