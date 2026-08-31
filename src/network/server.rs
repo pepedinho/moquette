@@ -125,8 +125,14 @@ async fn handl_packet(
 
                 let mut return_codes = Vec::with_capacity(payload.len());
                 for topic in payload {
-                    broker.subscribe(id.clone(), topic.filter, tx.clone());
-                    return_codes.push(SubackReturnCode::SuccessQoS0);
+                    broker.subscribe(id.clone(), topic.filter, tx.clone(), topic.qos);
+                    // The broker grants the requested QoS (already validated <= 2).
+                    let code = match topic.qos {
+                        1 => SubackReturnCode::SuccessQoS1,
+                        2 => SubackReturnCode::SuccessQoS2,
+                        _ => SubackReturnCode::SuccessQoS0,
+                    };
+                    return_codes.push(code);
                 }
 
                 let suback = ServerPacket::Suback {
